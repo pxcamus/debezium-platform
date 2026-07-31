@@ -71,10 +71,13 @@ The following operators must be installed in the cluster **before** deploying th
 | ingress.annotations                        | Extra ingress annotations                                                                                                                                                             | {}                                         |
 | ingress.tls.enabled                        | Enable TLS section on ingress                                                                                                                                                         | false                                      |
 | ingress.tls.secretName                     | Secret name used when TLS is enabled                                                                                                                                                  | ""                                         |
+| imagePullSecrets                           | Global list of image pull secrets, applied to every pod created by this chart. See [Image pull secrets](#image-pull-secrets).                                                          | []                                         |
 | stage.image                                | Image for the stage (UI)                                                                                                                                                              | quay.io/debezium/platform-stage:latest     |
 | stage.imagePullPolicy                      | Image pull policy for the stage container (UI). If empty it will default to IfNotPresent.                                                                                             | IfNotPresent                               |
+| stage.imagePullSecrets                     | Replaces the global `imagePullSecrets` for the stage pod. Leave empty to inherit it.                                                                                                  | []                                         |
 | conductor.image                            | Image for the conductor                                                                                                                                                               | quay.io/debezium/platform-conductor:latest |
 | conductor.imagePullPolicy                  | Image pull policy for the conductor container. If empty it will default to IfNotPresent.                                                                                              | IfNotPresent                               |
+| conductor.imagePullSecrets                 | Replaces the global `imagePullSecrets` for the conductor pod. Leave empty to inherit it.                                                                                              | []                                         |
 | conductor.offset.existingConfigMap         | Name of the config map used to store conductor offsets. If empty it will be automatically created.                                                                                    | ""                                         |
 | conductor.descriptors.official.enabled     | Enable official Debezium descriptors (downloaded via ORAS at startup)                                                                                                                 | true                                       |
 | conductor.descriptors.official.registry    | Registry hosting the descriptor OCI artifact                                                                                                                                          | quay.io                                    |
@@ -128,6 +131,71 @@ The following operators must be installed in the cluster **before** deploying th
 | monitoring.prometheus.serviceMonitor.enabled | Create a ServiceMonitor for automatic Prometheus scraping. Requires the Prometheus Operator to be installed (see Prerequisites).                                                      | true                                       |
 | monitoring.prometheus.serviceMonitor.scrapeInterval | Prometheus scrape interval                                                                                                                                                            | 15s                                        |
 | monitoring.prometheus.serviceMonitor.labels | Labels for Prometheus Operator ServiceMonitor discovery                                                                                                                               | {prometheus: kube-prometheus}              |
+
+## Image pull secrets
+
+To pull the conductor and stage images from a private registry, create a `docker-registry` secret in
+the release namespace and reference it from `imagePullSecrets`:
+
+```shell
+kubectl create secret docker-registry my-registry-secret \
+  --docker-server=registry.example.com \
+  --docker-username=<username> \
+  --docker-password=<password> \
+  --namespace <release-namespace>
+```
+
+If you have already authenticated to the registry with `docker login`, `podman login`, or `skopeo
+login`, the credentials can be taken from the resulting file instead. Despite the name, this format
+is not specific to Docker, and no container runtime is required to create the secret:
+
+```shell
+# scope the credentials to a single registry first
+podman login --authfile ./pull-auth.json registry.example.com
+
+kubectl create secret docker-registry my-registry-secret \
+  --from-file=.dockerconfigjson=./pull-auth.json \
+  --namespace <release-namespace>
+```
+
+The intermediate `--authfile` matters. The default credential store
+(`$XDG_RUNTIME_DIR/containers/auth.json` for Podman, `~/.docker/config.json` for Docker) accumulates
+an entry for every registry you have ever logged into, and `--from-file` copies the file verbatim.
+Pointing it at the default store would hand the cluster credentials for registries unrelated to this
+deployment.
+
+Then reference the secret:
+
+```yaml
+imagePullSecrets:
+  - name: my-registry-secret
+```
+
+The global list is applied to every pod created by the chart. To use a different secret for a single
+component, set its own `imagePullSecrets`:
+
+```yaml
+imagePullSecrets:
+  - name: shared-registry-secret
+
+conductor:
+  imagePullSecrets:
+    - name: conductor-registry-secret   # conductor uses this one only
+# stage has no imagePullSecrets, so it inherits shared-registry-secret
+```
+
+A per-component list **replaces** the global one, it is not merged with it. This follows the usual
+Helm chart convention. Two consequences worth knowing:
+
+- Leaving a component's `imagePullSecrets` empty means *inherit the global list*, so there is no way
+  to explicitly opt a single component out of a configured global list. Move the secret from the
+  global list to the components that need it instead.
+- `imagePullSecrets` is a pod-level field, so a component's list applies to every image the pod
+  pulls. If those images come from different registries, list one secret per registry; the kubelet
+  selects by registry host.
+
+The secret must live in the same namespace as the release. Nothing is rendered into the pod spec
+when both lists are empty, so existing installations are unaffected.
 
 ## Descriptor OCI Artifacts
 

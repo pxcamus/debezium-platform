@@ -10,6 +10,20 @@
                     "type": "string",
                     "enum": ["IfNotPresent", "Always", "Never"]
                 },
+                "imagePullSecrets": {
+                    "type": "array",
+                    "default": [],
+                    "description": "Replaces the global imagePullSecrets for the conductor pod. Leave empty to inherit it",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string"
+                            }
+                        },
+                        "required": ["name"]
+                    }
+                },
                 "offset": {
                     "properties": {
                         "existingConfigMap": {
@@ -226,6 +240,20 @@
                 "imagePullPolicy": {
                     "type": "string",
                     "enum": ["IfNotPresent", "Always", "Never"]
+                },
+                "imagePullSecrets": {
+                    "type": "array",
+                    "default": [],
+                    "description": "Replaces the global imagePullSecrets for the stage pod. Leave empty to inherit it",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string"
+                            }
+                        },
+                        "required": ["name"]
+                    }
                 }
             },
             "type": "object"
@@ -435,6 +463,20 @@
             }
           },
           "required": ["enabled", "tls"]
+        },
+        "imagePullSecrets": {
+            "type": "array",
+            "default": [],
+            "description": "Global list of image pull secrets, applied to every pod created by this chart. A per-component imagePullSecrets replaces this list, it is not merged with it",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string"
+                    }
+                },
+                "required": ["name"]
+            }
         }
     },
     "type": "object"

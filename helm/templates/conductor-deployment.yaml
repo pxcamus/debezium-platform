@@ -22,6 +22,11 @@ spec:
         app.kubernetes.io/name: conductor
     spec:
       serviceAccountName: conductor-service-account
+{{- $pullSecrets := coalesce .Values.conductor.imagePullSecrets .Values.imagePullSecrets }}
+{{- if $pullSecrets }}
+      imagePullSecrets:
+{{ toYaml $pullSecrets | indent 8 }}
+{{- end }}
       containers:
         - name: conductor
           image: {{ .Values.conductor.image }}
