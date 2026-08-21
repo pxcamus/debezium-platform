@@ -71,6 +71,16 @@ spec:
             - name: PIPELINE_SERVER_IMAGE
               value: {{ .Values.server.image }}
 {{- end }}
+{{- if .Values.pipeline.vault.enabled }}
+            - name: PIPELINE_VAULT_ENABLED
+              value: "true"
+            - name: PIPELINE_VAULT_AUDIENCE
+              value: {{ .Values.pipeline.vault.audience | quote }}
+            - name: PIPELINE_VAULT_VOLUME_NAME
+              value: {{ .Values.pipeline.vault.volumeName | quote }}
+            - name: PIPELINE_VAULT_TOKEN_EXPIRATION_SECONDS
+              value: {{ .Values.pipeline.vault.tokenExpirationSeconds | quote }}
+{{- end }}
 {{- if .Values.monitoring.otel.enabled }}
             - name: PIPELINE_MONITORING_OTEL_ENABLED
               value: "true"

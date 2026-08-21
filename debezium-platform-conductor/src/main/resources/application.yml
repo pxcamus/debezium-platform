@@ -68,6 +68,11 @@ pipeline:
       endpoint: ${PIPELINE_MONITORING_OTEL_ENDPOINT:http://localhost:4318}
       jmx-interval-ms: ${PIPELINE_MONITORING_OTEL_JMX_INTERVAL_MS:1000}
       metric-export-interval-ms: ${PIPELINE_MONITORING_OTEL_METRIC_EXPORT_INTERVAL_MS:5000}
+  vault:
+    enabled: ${PIPELINE_VAULT_ENABLED:false}
+    audience: ${PIPELINE_VAULT_AUDIENCE:openbao}
+    volume-name: ${PIPELINE_VAULT_VOLUME_NAME:openbao-token}
+    token-expiration-seconds: ${PIPELINE_VAULT_TOKEN_EXPIRATION_SECONDS:600}
 sources:
   database:
     connection:

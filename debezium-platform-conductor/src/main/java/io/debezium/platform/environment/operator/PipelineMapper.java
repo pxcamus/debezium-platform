@@ -35,6 +35,7 @@ import io.debezium.operator.api.model.runtime.Runtime;
 import io.debezium.operator.api.model.runtime.RuntimeApiBuilder;
 import io.debezium.operator.api.model.runtime.RuntimeBuilder;
 import io.debezium.operator.api.model.runtime.metrics.Metrics;
+import io.debezium.operator.api.model.runtime.storage.RuntimeStorage;
 import io.debezium.operator.api.model.source.Offset;
 import io.debezium.operator.api.model.source.OffsetBuilder;
 import io.debezium.operator.api.model.source.SchemaHistory;
@@ -48,6 +49,10 @@ import io.debezium.platform.domain.views.Transform;
 import io.debezium.platform.domain.views.flat.PipelineFlat;
 import io.debezium.platform.environment.operator.configuration.TableNameResolver;
 import io.fabric8.kubernetes.api.model.ObjectMetaBuilder;
+import io.fabric8.kubernetes.api.model.ServiceAccountTokenProjectionBuilder;
+import io.fabric8.kubernetes.api.model.Volume;
+import io.fabric8.kubernetes.api.model.VolumeBuilder;
+import io.fabric8.kubernetes.api.model.VolumeProjectionBuilder;
 
 @ApplicationScoped
 public class PipelineMapper {
@@ -64,6 +69,9 @@ public class PipelineMapper {
     private static final String LOG_LEVEL_PROP_NAME = "log.level";
     private static final String LOG_CONSOLE_JSON_PROP_NAME = "log.console.json";
     private static final List<String> RESOLVABLE_CONFIGS = List.of("jdbc.schema.history.table.name", "jdbc.offset.table.name");
+
+    private static final String SERVICE_ACCOUNT_NAME_FORMAT = "%s-sa";
+    private static final String VAULT_TOKEN_FILE_NAME = "token";
 
     private static final String KAFKA_CONNECTION_CONFIGURATION_PREFIX = "producer.";
     private static final String MONGODB_CONNECTION_CONFIGURATION_PREFIX = "mongodb.";
@@ -95,7 +103,7 @@ public class PipelineMapper {
 
         var dsQuarkus = createQuarkus(pipeline);
 
-        var dsRuntime = createRuntime();
+        var dsRuntime = createRuntime(pipeline);
 
         var dsSource = createSource(pipeline);
 
@@ -153,10 +161,66 @@ public class PipelineMapper {
                 .build();
     }
 
-    private Runtime createRuntime() {
-        return new RuntimeBuilder()
+    private Runtime createRuntime(PipelineFlat pipeline) {
+        var runtimeBuilder = new RuntimeBuilder()
                 .withApi(new RuntimeApiBuilder().withEnabled().build())
-                .withMetrics(metrics)
+                .withMetrics(metrics);
+
+        if (pipelineConfigGroup.vault().enabled()) {
+            // The pod runs as its own account so the backend can tell pipelines apart, and so the
+            // account can carry cloud workload-identity annotations where those are what bind it.
+            // Naming it here also stops the operator creating one of its own: ServiceAccountDependent
+            // declines when spec.runtime.serviceAccount is set, which is what makes the account ours
+            // to create and to delete.
+            runtimeBuilder.withServiceAccount(serviceAccountNameFor(pipeline));
+            runtimeBuilder.withStorage(createVaultTokenStorage());
+        }
+
+        return runtimeBuilder.build();
+    }
+
+    /**
+     * Name of the ServiceAccount a pipeline pod runs as.
+     * <p>
+     * Matches the name the operator would have generated, so enabling workload identity takes over
+     * the existing account rather than leaving an orphan beside it.
+     * </p>
+     */
+    private static String serviceAccountNameFor(PipelineFlat pipeline) {
+        return SERVICE_ACCOUNT_NAME_FORMAT.formatted(pipeline.getName());
+    }
+
+    /**
+     * Builds the runtime storage carrying the projected backend token.
+     * <p>
+     * {@code runtime.storage.external} is the only place a {@code DebeziumServer} can express a
+     * volume — neither {@code runtime.templates.pod} nor any other field accepts one — and the
+     * operator mounts what it finds there at {@code /debezium/external/<name>}.
+     * </p>
+     */
+    private RuntimeStorage createVaultTokenStorage() {
+        var storage = new RuntimeStorage();
+        storage.setExternal(List.of(createVaultTokenVolume()));
+        return storage;
+    }
+
+    private Volume createVaultTokenVolume() {
+        var vault = pipelineConfigGroup.vault();
+
+        // The audience is the whole point: a token stamped for the secret backend cannot be replayed
+        // against the Kubernetes API server. Leave it out and it silently defaults back to the API
+        // server, undoing that.
+        var tokenProjection = new ServiceAccountTokenProjectionBuilder()
+                .withPath(VAULT_TOKEN_FILE_NAME)
+                .withAudience(vault.audience())
+                .withExpirationSeconds(vault.tokenExpirationSeconds())
+                .build();
+
+        return new VolumeBuilder()
+                .withName(vault.volumeName())
+                .withNewProjected()
+                .withSources(new VolumeProjectionBuilder().withServiceAccountToken(tokenProjection).build())
+                .endProjected()
                 .build();
     }
 

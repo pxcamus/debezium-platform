@@ -16,3 +16,12 @@ rules:
   - apiGroups: [ "" ]
     resources: [ "pods", "pods/log", "services" ]
     verbs: [ "get", "list" ]
+{{- if .Values.pipeline.vault.enabled }}
+  # Only when pipelines carry a workload identity: the conductor then owns the ServiceAccount each
+  # pipeline pod runs as, because the operator generates one only when the resource names none.
+  # Deliberately no rule for roles or rolebindings — creating an empty account grants nothing, while
+  # the ability to bind roles to accounts is a short step from granting oneself permissions.
+  - apiGroups: [ "" ]
+    resources: [ "serviceaccounts" ]
+    verbs: [ "create", "update", "patch", "get", "list", "delete", "deletecollection" ]
+{{- end }}

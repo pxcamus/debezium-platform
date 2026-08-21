@@ -250,6 +250,31 @@
                     },
                     "default": {},
                     "description": "Map of labels to apply to DebeziumServer custom resources created by pipelines"
+                },
+                "vault": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Give each pipeline pod its own ServiceAccount and a projected token scoped to the secret backend, so it fetches its own credentials"
+                        },
+                        "audience": {
+                            "type": "string",
+                            "default": "openbao",
+                            "description": "Audience claim requested for the projected token; must match the audience the backend's Kubernetes auth role is bound to"
+                        },
+                        "volumeName": {
+                            "type": "string",
+                            "default": "openbao-token",
+                            "description": "Name of the projected volume; the operator mounts it at /debezium/external/<volumeName>"
+                        },
+                        "tokenExpirationSeconds": {
+                            "type": "integer",
+                            "default": 600,
+                            "description": "Requested lifetime of the projected token in seconds; the kubelet rotates it before expiry"
+                        }
+                    }
                 }
             }
         },

@@ -106,6 +106,64 @@ public class PipelineMapperTest {
     }
 
     @Test
+    public void testMapper_ShouldNotGiveWorkloadIdentityWhenVaultDisabled() {
+        when(pipelineConfigGroup.vault().enabled()).thenReturn(false);
+
+        var pipeline = mockPipelineWithSource(ConnectionEntity.Type.POSTGRESQL, Map.of(DATABASE, "customers"));
+        when(pipeline.getName()).thenReturn("pipeline-a");
+
+        var runtime = pipelineMapper.map(pipeline).getSpec().getRuntime();
+
+        // Leaving serviceAccount unset is what makes the operator create and own one, which is the
+        // behaviour every existing deployment relies on.
+        assertThat(runtime.getServiceAccount()).isNull();
+        assertThat(runtime.getStorage().getExternal()).isEmpty();
+    }
+
+    @Test
+    public void testMapper_ShouldGiveEachPipelineItsOwnIdentityWhenVaultEnabled() {
+        when(pipelineConfigGroup.vault().enabled()).thenReturn(true);
+        when(pipelineConfigGroup.vault().audience()).thenReturn("openbao");
+        when(pipelineConfigGroup.vault().volumeName()).thenReturn("openbao-token");
+        when(pipelineConfigGroup.vault().tokenExpirationSeconds()).thenReturn(600L);
+
+        var pipeline = mockPipelineWithSource(ConnectionEntity.Type.POSTGRESQL, Map.of(DATABASE, "customers"));
+        when(pipeline.getName()).thenReturn("pipeline-a");
+
+        var runtime = pipelineMapper.map(pipeline).getSpec().getRuntime();
+
+        assertThat(runtime.getServiceAccount()).isEqualTo("pipeline-a-sa");
+        assertThat(runtime.getStorage().getExternal()).hasSize(1);
+
+        var volume = runtime.getStorage().getExternal().getFirst();
+        assertThat(volume.getName()).isEqualTo("openbao-token");
+
+        var token = volume.getProjected().getSources().getFirst().getServiceAccountToken();
+        // The audience is what stops a token issued for the secret backend being replayed against
+        // the Kubernetes API server, so an unset one is a security regression rather than a default.
+        assertThat(token.getAudience()).isEqualTo("openbao");
+        assertThat(token.getPath()).isEqualTo("token");
+        assertThat(token.getExpirationSeconds()).isEqualTo(600L);
+    }
+
+    @Test
+    public void testMapper_ShouldKeepEphemeralDataStorageWhenVaultEnabled() {
+        when(pipelineConfigGroup.vault().enabled()).thenReturn(true);
+        when(pipelineConfigGroup.vault().audience()).thenReturn("openbao");
+        when(pipelineConfigGroup.vault().volumeName()).thenReturn("openbao-token");
+        when(pipelineConfigGroup.vault().tokenExpirationSeconds()).thenReturn(600L);
+
+        var pipeline = mockPipelineWithSource(ConnectionEntity.Type.POSTGRESQL, Map.of(DATABASE, "customers"));
+        when(pipeline.getName()).thenReturn("pipeline-a");
+
+        var storage = pipelineMapper.map(pipeline).getSpec().getRuntime().getStorage();
+
+        // Adding an external volume must not silently drop the data storage the pipeline already
+        // had; it is a sibling field on the same object.
+        assertThat(storage.getData()).isNotNull();
+    }
+
+    @Test
     public void testResolveSinkType_ShouldReturnShortNameAlreadyShort() {
         assertThat(PipelineMapper.resolveSinkType("kafka")).isEqualTo("kafka");
         assertThat(PipelineMapper.resolveSinkType("kinesis")).isEqualTo("kinesis");

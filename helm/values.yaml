@@ -80,6 +80,17 @@ debezium-operator:
   enabled: true
 pipeline:
   labels: {}
+  # Give each pipeline pod its own Kubernetes identity so it can fetch its database credentials
+  # from a secret backend itself, instead of the password being copied into the DebeziumServer
+  # resource and its ConfigMap. Enabling this makes the conductor create one ServiceAccount per
+  # pipeline, which is why it also adds a ServiceAccount rule to the conductor's Role.
+  vault:
+    enabled: false
+    # Must match the audience the backend's Kubernetes auth role is bound to.
+    audience: openbao
+    # The operator mounts this at /debezium/external/<volumeName>.
+    volumeName: openbao-token
+    tokenExpirationSeconds: 600
 monitoring:
   otel:
     enabled: false
