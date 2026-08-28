@@ -9,6 +9,7 @@ import static io.debezium.platform.environment.database.DatabaseConnectionConfig
 import static io.debezium.platform.environment.database.DatabaseConnectionConfiguration.USERNAME;
 import static io.debezium.platform.environment.operator.OperatorPipelineController.LABEL_DBZ_CONDUCTOR_ID;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.tuple;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -161,6 +162,66 @@ public class PipelineMapperTest {
         // Adding an external volume must not silently drop the data storage the pipeline already
         // had; it is a sibling field on the same object.
         assertThat(storage.getData()).isNotNull();
+    }
+
+    @Test
+    public void testMapper_ShouldEmitVaultReferencesInsteadOfCredentials() {
+        when(pipelineConfigGroup.vault().enabled()).thenReturn(true);
+        when(pipelineConfigGroup.vault().audience()).thenReturn("openbao");
+        when(pipelineConfigGroup.vault().volumeName()).thenReturn("openbao-token");
+        when(pipelineConfigGroup.vault().tokenExpirationSeconds()).thenReturn(600L);
+        when(pipelineConfigGroup.vault().name()).thenReturn("openbao");
+        when(pipelineConfigGroup.vault().authRole()).thenReturn("pipeline");
+        when(pipelineConfigGroup.vault().address()).thenReturn(Optional.of("http://openbao.openbao.svc:8200"));
+        when(pipelineConfigGroup.vault().path()).thenReturn(Optional.of("database/creds/pipeline"));
+
+        var pipeline = mockPipelineWithSource(ConnectionEntity.Type.POSTGRESQL, Map.of(
+                DATABASE, "customers",
+                USERNAME, "a-stored-username"));
+        when(pipeline.getName()).thenReturn("pipeline-a");
+
+        var spec = pipelineMapper.map(pipeline).getSpec();
+
+        // The whole point: what lands in the resource is a vault name and a key, not a credential.
+        assertThat(spec.getSource().getConfig().getProps())
+                .containsEntry("database.user", "${vault::openbao/username}")
+                .containsEntry("database.password", "${vault::openbao/password}");
+
+        // ...including when the stored connection had a username of its own, which the reference
+        // must override rather than sit beside.
+        assertThat(spec.getSource().getConfig().getProps())
+                .doesNotContainValue("a-stored-username");
+
+        assertThat(spec.getRuntime().getEnvironment().getVars())
+                .extracting("name", "value")
+                .contains(
+                        tuple("DEBEZIUM_VAULT_NAMES", "openbao"),
+                        tuple("DEBEZIUM_VAULT_OPENBAO_ADDRESS", "http://openbao.openbao.svc:8200"),
+                        tuple("DEBEZIUM_VAULT_OPENBAO_PATH", "database/creds/pipeline"),
+                        tuple("DEBEZIUM_VAULT_OPENBAO_AUTH_ROLE", "pipeline"),
+                        tuple("DEBEZIUM_VAULT_OPENBAO_AUTH_TOKEN_PATH", "/debezium/external/openbao-token/token"));
+    }
+
+    @Test
+    public void testMapper_ShouldKeepCredentialsWhenVaultHasNoAddress() {
+        when(pipelineConfigGroup.vault().enabled()).thenReturn(true);
+        when(pipelineConfigGroup.vault().audience()).thenReturn("openbao");
+        when(pipelineConfigGroup.vault().volumeName()).thenReturn("openbao-token");
+        when(pipelineConfigGroup.vault().tokenExpirationSeconds()).thenReturn(600L);
+        when(pipelineConfigGroup.vault().address()).thenReturn(Optional.empty());
+        when(pipelineConfigGroup.vault().path()).thenReturn(Optional.empty());
+
+        var pipeline = mockPipelineWithSource(ConnectionEntity.Type.POSTGRESQL, Map.of(
+                DATABASE, "customers",
+                USERNAME, "a-stored-username"));
+        when(pipeline.getName()).thenReturn("pipeline-a");
+
+        var spec = pipelineMapper.map(pipeline).getSpec();
+
+        // Identity without resolution is a deliberate intermediate state: the pod can prove who it
+        // is, while credentials still come from the stored connection.
+        assertThat(spec.getRuntime().getServiceAccount()).isEqualTo("pipeline-a-sa");
+        assertThat(spec.getSource().getConfig().getProps()).containsEntry("database.user", "a-stored-username");
     }
 
     @Test

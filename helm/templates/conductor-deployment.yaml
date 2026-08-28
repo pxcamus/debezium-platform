@@ -76,6 +76,18 @@ spec:
               value: "true"
             - name: PIPELINE_VAULT_AUDIENCE
               value: {{ .Values.pipeline.vault.audience | quote }}
+            - name: PIPELINE_VAULT_NAME
+              value: {{ .Values.pipeline.vault.name | quote }}
+            - name: PIPELINE_VAULT_AUTH_ROLE
+              value: {{ .Values.pipeline.vault.authRole | quote }}
+{{- if .Values.pipeline.vault.address }}
+            - name: PIPELINE_VAULT_ADDRESS
+              value: {{ .Values.pipeline.vault.address | quote }}
+{{- end }}
+{{- if .Values.pipeline.vault.path }}
+            - name: PIPELINE_VAULT_PATH
+              value: {{ .Values.pipeline.vault.path | quote }}
+{{- end }}
             - name: PIPELINE_VAULT_VOLUME_NAME
               value: {{ .Values.pipeline.vault.volumeName | quote }}
             - name: PIPELINE_VAULT_TOKEN_EXPIRATION_SECONDS

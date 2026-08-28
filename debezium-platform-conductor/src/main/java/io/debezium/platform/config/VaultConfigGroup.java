@@ -5,6 +5,8 @@
  */
 package io.debezium.platform.config;
 
+import java.util.Optional;
+
 import io.smallrye.config.WithDefault;
 import io.smallrye.config.WithName;
 
@@ -61,6 +63,48 @@ public interface VaultConfigGroup {
     @WithDefault("openbao-token")
     @WithName("volume-name")
     String volumeName();
+
+    /**
+     * Returns the name pipelines use to refer to this vault in configuration expressions, as in
+     * {@code ${vault::<name>/password}}.
+     * <p>
+     * Kept free of hyphens by default because the coordinates reach the pipeline pod as
+     * environment variables, and a hyphen in the name becomes indistinguishable from the property
+     * separator once the name is upper-cased.
+     * </p>
+     *
+     * @return the vault name
+     */
+    @WithDefault("openbao")
+    String name();
+
+    /**
+     * Returns the address of the secret store, as reachable from a pipeline pod.
+     *
+     * @return the base URL, or empty when credentials are still written into the pipeline config
+     */
+    Optional<String> address();
+
+    /**
+     * Returns the path a pipeline reads its database credentials from.
+     * <p>
+     * Fixed per platform for now. Making it per-pipeline is what the {@code Vault} entity and its
+     * associations to sources and destinations are for, and is a design question rather than a
+     * configuration one.
+     * </p>
+     *
+     * @return the secret path, e.g. {@code database/creds/pipeline}
+     */
+    Optional<String> path();
+
+    /**
+     * Returns the Kubernetes auth role a pipeline logs in with.
+     *
+     * @return the role name
+     */
+    @WithDefault("pipeline")
+    @WithName("auth-role")
+    String authRole();
 
     /**
      * Returns the requested lifetime of the projected token, in seconds.

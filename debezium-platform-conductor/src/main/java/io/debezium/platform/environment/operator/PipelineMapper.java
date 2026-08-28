@@ -14,7 +14,9 @@ import static io.debezium.platform.environment.database.DatabaseConnectionFactor
 
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 import jakarta.enterprise.context.ApplicationScoped;
@@ -34,8 +36,10 @@ import io.debezium.operator.api.model.TransformationBuilder;
 import io.debezium.operator.api.model.runtime.Runtime;
 import io.debezium.operator.api.model.runtime.RuntimeApiBuilder;
 import io.debezium.operator.api.model.runtime.RuntimeBuilder;
+import io.debezium.operator.api.model.runtime.RuntimeEnvironment;
 import io.debezium.operator.api.model.runtime.metrics.Metrics;
 import io.debezium.operator.api.model.runtime.storage.RuntimeStorage;
+import io.debezium.operator.api.model.runtime.templates.ContainerEnvVar;
 import io.debezium.operator.api.model.source.Offset;
 import io.debezium.operator.api.model.source.OffsetBuilder;
 import io.debezium.operator.api.model.source.SchemaHistory;
@@ -72,6 +76,12 @@ public class PipelineMapper {
 
     private static final String SERVICE_ACCOUNT_NAME_FORMAT = "%s-sa";
     private static final String VAULT_TOKEN_FILE_NAME = "token";
+    private static final String VAULT_TOKEN_MOUNT_FORMAT = "/debezium/external/%s/%s";
+    private static final String VAULT_REFERENCE_FORMAT = "${vault::%s/%s}";
+    private static final String VAULT_USERNAME_KEY = "username";
+    private static final String VAULT_PASSWORD_KEY = "password";
+    private static final String DATABASE_USER_CONFIG = "database.user";
+    private static final String DATABASE_PASSWORD_CONFIG = "database.password";
 
     private static final String KAFKA_CONNECTION_CONFIGURATION_PREFIX = "producer.";
     private static final String MONGODB_CONNECTION_CONFIGURATION_PREFIX = "mongodb.";
@@ -174,6 +184,7 @@ public class PipelineMapper {
             // to create and to delete.
             runtimeBuilder.withServiceAccount(serviceAccountNameFor(pipeline));
             runtimeBuilder.withStorage(createVaultTokenStorage());
+            createVaultEnvironment().ifPresent(runtimeBuilder::withEnvironment);
         }
 
         return runtimeBuilder.build();
@@ -224,6 +235,68 @@ public class PipelineMapper {
                 .build();
     }
 
+    /**
+     * Tells the pipeline where its secret store is, as environment variables.
+     * <p>
+     * Environment variables rather than configuration properties because {@code spec.quarkus.config}
+     * renders under the {@code quarkus.} prefix and nothing in the custom resource renders a bare
+     * {@code debezium.vault.*} property. MicroProfile maps {@code DEBEZIUM_VAULT_...} back onto the
+     * dotted name when the server looks it up, so the destination is the same; only the route
+     * differs.
+     * </p>
+     */
+    private Optional<RuntimeEnvironment> createVaultEnvironment() {
+        var vault = pipelineConfigGroup.vault();
+
+        if (vault.address().isEmpty() || vault.path().isEmpty()) {
+            // Identity without resolution: the pod gets a token it can present, while credentials
+            // are still written into the configuration. A deliberate intermediate state.
+            return Optional.empty();
+        }
+
+        String prefix = "DEBEZIUM_VAULT_" + vault.name().toUpperCase(Locale.ROOT) + "_";
+
+        var environment = new RuntimeEnvironment();
+        environment.setVars(List.of(
+                // Naming the vaults explicitly, because the server cannot enumerate them from
+                // environment variables — the vault name and the property beneath it are no longer
+                // distinguishable once both are upper-cased.
+                envVar("DEBEZIUM_VAULT_NAMES", vault.name()),
+                envVar(prefix + "ADDRESS", vault.address().get()),
+                envVar(prefix + "PATH", vault.path().get()),
+                envVar(prefix + "AUTH_ROLE", vault.authRole()),
+                envVar(prefix + "AUTH_TOKEN_PATH",
+                        VAULT_TOKEN_MOUNT_FORMAT.formatted(vault.volumeName(), VAULT_TOKEN_FILE_NAME))));
+
+        return Optional.of(environment);
+    }
+
+    private static ContainerEnvVar envVar(String name, String value) {
+        var variable = new ContainerEnvVar();
+        variable.setName(name);
+        variable.setValue(value);
+        return variable;
+    }
+
+    /**
+     * Replaces the connection's stored credentials with references the pipeline resolves itself.
+     * <p>
+     * This is the point of the whole design: what lands in the custom resource and its ConfigMap is
+     * a vault name and a key, neither of them secret. The credential is fetched at startup by the
+     * pod, using an identity Kubernetes vouches for, and is never written down.
+     * </p>
+     */
+    private void applyVaultReferences(ConfigProperties sourceConfig) {
+        var vault = pipelineConfigGroup.vault();
+
+        if (!vault.enabled() || vault.address().isEmpty() || vault.path().isEmpty()) {
+            return;
+        }
+
+        sourceConfig.setProps(DATABASE_USER_CONFIG, VAULT_REFERENCE_FORMAT.formatted(vault.name(), VAULT_USERNAME_KEY));
+        sourceConfig.setProps(DATABASE_PASSWORD_CONFIG, VAULT_REFERENCE_FORMAT.formatted(vault.name(), VAULT_PASSWORD_KEY));
+    }
+
     private Sink createSink(PipelineFlat pipeline) {
 
         var sink = pipeline.getDestination();
@@ -257,6 +330,9 @@ public class PipelineMapper {
         sourceConfig.setAllProps(source.getConfig());
         sourceConfig.setProps(SIGNAL_ENABLED_CHANNELS_CONFIG, DEFAULT_SIGNAL_CHANNELS);
         sourceConfig.setProps(NOTIFICATION_ENABLED_CHANNELS_CONFIG, DEFAULT_NOTIFICATION_CHANNELS);
+
+        // Last, so it overrides whatever the stored connection supplied.
+        applyVaultReferences(sourceConfig);
 
         return new SourceBuilder()
                 .withSourceClass(source.getType())

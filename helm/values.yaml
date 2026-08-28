@@ -91,6 +91,15 @@ pipeline:
     # The operator mounts this at /debezium/external/<volumeName>.
     volumeName: openbao-token
     tokenExpirationSeconds: 600
+    # The name pipelines refer to in ${vault::<name>/password}. Avoid hyphens: the coordinates
+    # reach the pod as environment variables, where a hyphen becomes indistinguishable from the
+    # property separator.
+    name: openbao
+    authRole: pipeline
+    # Set both to make pipelines resolve their credentials from the store. Left empty, a pipeline
+    # still gets its own identity but keeps the credential written into its configuration.
+    address: ""
+    path: ""
 monitoring:
   otel:
     enabled: false

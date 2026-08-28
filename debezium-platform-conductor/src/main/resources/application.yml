@@ -70,6 +70,10 @@ pipeline:
       metric-export-interval-ms: ${PIPELINE_MONITORING_OTEL_METRIC_EXPORT_INTERVAL_MS:5000}
   vault:
     enabled: ${PIPELINE_VAULT_ENABLED:false}
+    name: ${PIPELINE_VAULT_NAME:openbao}
+    address: ${PIPELINE_VAULT_ADDRESS:}
+    path: ${PIPELINE_VAULT_PATH:}
+    auth-role: ${PIPELINE_VAULT_AUTH_ROLE:pipeline}
     audience: ${PIPELINE_VAULT_AUDIENCE:openbao}
     volume-name: ${PIPELINE_VAULT_VOLUME_NAME:openbao-token}
     token-expiration-seconds: ${PIPELINE_VAULT_TOKEN_EXPIRATION_SECONDS:600}
