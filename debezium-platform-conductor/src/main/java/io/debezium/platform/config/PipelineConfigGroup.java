@@ -41,6 +41,8 @@ public interface PipelineConfigGroup {
 
     HealthProbesConfigGroup health();
 
+    VaultConfigGroup vault();
+
     interface HostConfig {
 
         @WithName("container-runtime")

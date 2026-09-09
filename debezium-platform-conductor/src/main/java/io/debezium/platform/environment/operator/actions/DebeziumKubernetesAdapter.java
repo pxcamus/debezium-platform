@@ -16,6 +16,8 @@ import org.slf4j.LoggerFactory;
 import io.debezium.operator.api.model.DebeziumServer;
 import io.fabric8.kubernetes.api.model.ObjectMeta;
 import io.fabric8.kubernetes.api.model.Service;
+import io.fabric8.kubernetes.api.model.ServiceAccount;
+import io.fabric8.kubernetes.api.model.ServiceAccountBuilder;
 import io.fabric8.kubernetes.api.model.ServiceList;
 import io.fabric8.kubernetes.client.KubernetesClient;
 import io.fabric8.kubernetes.client.dsl.TailPrettyLoggable;
@@ -96,8 +98,48 @@ public class DebeziumKubernetesAdapter {
      * @param debeziumServer The DebeziumServer resource to deploy.
      */
     public void deployPipeline(DebeziumServer debeziumServer) {
+        ensureServiceAccount(debeziumServer);
+
         // apply to server
         kubernetesClient.resource(debeziumServer).serverSideApply();
+    }
+
+    /**
+     * Creates the ServiceAccount a pipeline pod runs as, when the pipeline names one.
+     * <p>
+     * The operator generates an account of its own only when {@code spec.runtime.serviceAccount} is
+     * empty, so naming one transfers that responsibility here. The account is created before the
+     * custom resource so it exists by the time the operator schedules a pod.
+     * </p>
+     * <p>
+     * {@code automountServiceAccountToken: false} is the reason this is worth doing at all. The
+     * field does not exist on the {@code DebeziumServer} resource, but it does exist on a
+     * ServiceAccount, and the pod-level setting — the one that would override it — is left unset by
+     * the operator. So the pipeline pod ends up holding the projected backend token and no token
+     * usable against the Kubernetes API.
+     * </p>
+     *
+     * @param debeziumServer the resource about to be applied; its runtime names the account
+     */
+    private void ensureServiceAccount(DebeziumServer debeziumServer) {
+        var runtime = debeziumServer.getSpec().getRuntime();
+
+        if (runtime == null || runtime.getServiceAccount() == null || runtime.getServiceAccount().isBlank()) {
+            return;
+        }
+
+        // Labels rather than an owner reference: the resource does not exist yet when the account is
+        // created, and undeployPipeline already deletes by the same label.
+        var serviceAccount = new ServiceAccountBuilder()
+                .withNewMetadata()
+                .withName(runtime.getServiceAccount())
+                .withNamespace(debeziumServer.getMetadata().getNamespace())
+                .withLabels(debeziumServer.getMetadata().getLabels())
+                .endMetadata()
+                .withAutomountServiceAccountToken(false)
+                .build();
+
+        kubernetesClient.resource(serviceAccount).serverSideApply();
     }
 
     /**
@@ -110,8 +152,16 @@ public class DebeziumKubernetesAdapter {
      * @param pipelineId The pipeline id used to identify the DebeziumServer resources to be deleted.
      */
     public void undeployPipeline(Long pipelineId) {
+        var conductorLabel = Map.of(LABEL_DBZ_CONDUCTOR_ID, pipelineId.toString());
+
         kubernetesClient.resources(DebeziumServer.class)
-                .withLabels(Map.of(LABEL_DBZ_CONDUCTOR_ID, pipelineId.toString()))
+                .withLabels(conductorLabel)
+                .delete();
+
+        // Only accounts this conductor created carry the label; an operator-generated one does not,
+        // and is garbage-collected with the resource that owns it.
+        kubernetesClient.resources(ServiceAccount.class)
+                .withLabels(conductorLabel)
                 .delete();
     }
 
