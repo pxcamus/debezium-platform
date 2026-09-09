@@ -12,10 +12,17 @@ import static io.debezium.platform.environment.database.DatabaseConnectionConfig
 import static io.debezium.platform.environment.database.DatabaseConnectionConfiguration.USERNAME;
 import static io.debezium.platform.environment.database.DatabaseConnectionFactory.DATABASE_CONNECTION_CONFIGURATION_PREFIX;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.TreeMap;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import jakarta.enterprise.context.ApplicationScoped;
 
@@ -34,7 +41,10 @@ import io.debezium.operator.api.model.TransformationBuilder;
 import io.debezium.operator.api.model.runtime.Runtime;
 import io.debezium.operator.api.model.runtime.RuntimeApiBuilder;
 import io.debezium.operator.api.model.runtime.RuntimeBuilder;
+import io.debezium.operator.api.model.runtime.RuntimeEnvironment;
 import io.debezium.operator.api.model.runtime.metrics.Metrics;
+import io.debezium.operator.api.model.runtime.storage.RuntimeStorage;
+import io.debezium.operator.api.model.runtime.templates.ContainerEnvVar;
 import io.debezium.operator.api.model.runtime.templates.ContainerTemplate;
 import io.debezium.operator.api.model.runtime.templates.Probe;
 import io.debezium.operator.api.model.runtime.templates.Probes;
@@ -48,10 +58,18 @@ import io.debezium.operator.api.model.source.SourceBuilder;
 import io.debezium.operator.api.model.source.storage.CustomStoreBuilder;
 import io.debezium.platform.config.PipelineConfigGroup;
 import io.debezium.platform.data.model.ConnectionEntity;
+import io.debezium.platform.domain.VaultService;
+import io.debezium.platform.domain.views.PipelineComponent;
 import io.debezium.platform.domain.views.Transform;
+import io.debezium.platform.domain.views.Vault;
 import io.debezium.platform.domain.views.flat.PipelineFlat;
+import io.debezium.platform.domain.views.refs.VaultReference;
 import io.debezium.platform.environment.operator.configuration.TableNameResolver;
 import io.fabric8.kubernetes.api.model.ObjectMetaBuilder;
+import io.fabric8.kubernetes.api.model.ServiceAccountTokenProjectionBuilder;
+import io.fabric8.kubernetes.api.model.Volume;
+import io.fabric8.kubernetes.api.model.VolumeBuilder;
+import io.fabric8.kubernetes.api.model.VolumeProjectionBuilder;
 
 @ApplicationScoped
 public class PipelineMapper {
@@ -68,6 +86,13 @@ public class PipelineMapper {
     private static final String LOG_LEVEL_PROP_NAME = "log.level";
     private static final String LOG_CONSOLE_JSON_PROP_NAME = "log.console.json";
     private static final List<String> RESOLVABLE_CONFIGS = List.of("jdbc.schema.history.table.name", "jdbc.offset.table.name");
+
+    private static final String SERVICE_ACCOUNT_NAME_FORMAT = "%s-sa";
+    private static final String VAULT_TOKEN_FILE_NAME = "token";
+    private static final String VAULT_TOKEN_MOUNT_FORMAT = "/debezium/external/%s/%s";
+    private static final String VAULT_ENV_PREFIX = "DEBEZIUM_VAULT_";
+    private static final String VAULT_NAMES_ENV = VAULT_ENV_PREFIX + "NAMES";
+    private static final String VAULT_PATH_ITEM = "path";
 
     private static final String KAFKA_CONNECTION_CONFIGURATION_PREFIX = "producer.";
     private static final String MONGODB_CONNECTION_CONFIGURATION_PREFIX = "mongodb.";
@@ -86,20 +111,23 @@ public class PipelineMapper {
     final PipelineConfigGroup pipelineConfigGroup;
     final TableNameResolver tableNameResolver;
     final Metrics metrics;
+    final VaultService vaultService;
 
     public PipelineMapper(PipelineConfigGroup pipelineConfigGroup,
                           TableNameResolver tableNameResolver,
-                          Metrics metrics) {
+                          Metrics metrics,
+                          VaultService vaultService) {
         this.pipelineConfigGroup = pipelineConfigGroup;
         this.tableNameResolver = tableNameResolver;
         this.metrics = metrics;
+        this.vaultService = vaultService;
     }
 
     public DebeziumServer map(PipelineFlat pipeline) {
 
         var dsQuarkus = createQuarkus(pipeline);
 
-        var dsRuntime = createRuntime();
+        var dsRuntime = createRuntime(pipeline);
 
         var dsSource = createSource(pipeline);
 
@@ -157,7 +185,7 @@ public class PipelineMapper {
                 .build();
     }
 
-    private Runtime createRuntime() {
+    private Runtime createRuntime(PipelineFlat pipeline) {
         var healthConfig = pipelineConfigGroup.health();
 
         var livenessProbe = new Probe();
@@ -182,11 +210,165 @@ public class PipelineMapper {
         var templates = new Templates();
         templates.setContainer(container);
 
-        return new RuntimeBuilder()
+        var runtimeBuilder = new RuntimeBuilder()
                 .withApi(new RuntimeApiBuilder().withEnabled().build())
                 .withMetrics(metrics)
-                .withTemplates(templates)
+                .withTemplates(templates);
+
+        if (pipelineConfigGroup.vault().enabled()) {
+            // The pod runs as its own account so the backend can tell pipelines apart, and so the
+            // account can carry cloud workload-identity annotations where those are what bind it.
+            // Naming it here also stops the operator creating one of its own: ServiceAccountDependent
+            // declines when spec.runtime.serviceAccount is set, which is what makes the account ours
+            // to create and to delete.
+            runtimeBuilder.withServiceAccount(serviceAccountNameFor(pipeline));
+            runtimeBuilder.withStorage(createVaultTokenStorage());
+            createVaultEnvironment(pipeline).ifPresent(runtimeBuilder::withEnvironment);
+        }
+
+        return runtimeBuilder.build();
+    }
+
+    /**
+     * Name of the ServiceAccount a pipeline pod runs as.
+     * <p>
+     * Matches the name the operator would have generated, so enabling workload identity takes over
+     * the existing account rather than leaving an orphan beside it.
+     * </p>
+     */
+    private static String serviceAccountNameFor(PipelineFlat pipeline) {
+        return SERVICE_ACCOUNT_NAME_FORMAT.formatted(pipeline.getName());
+    }
+
+    /**
+     * Builds the runtime storage carrying the projected backend token.
+     * <p>
+     * {@code runtime.storage.external} is the only place a {@code DebeziumServer} can express a
+     * volume — neither {@code runtime.templates.pod} nor any other field accepts one — and the
+     * operator mounts what it finds there at {@code /debezium/external/<name>}.
+     * </p>
+     */
+    private RuntimeStorage createVaultTokenStorage() {
+        var storage = new RuntimeStorage();
+        storage.setExternal(List.of(createVaultTokenVolume()));
+        return storage;
+    }
+
+    private Volume createVaultTokenVolume() {
+        var vault = pipelineConfigGroup.vault();
+
+        // The audience is the whole point: a token stamped for the secret backend cannot be replayed
+        // against the Kubernetes API server. Leave it out and it silently defaults back to the API
+        // server, undoing that.
+        var tokenProjection = new ServiceAccountTokenProjectionBuilder()
+                .withPath(VAULT_TOKEN_FILE_NAME)
+                .withAudience(vault.audience())
+                .withExpirationSeconds(vault.tokenExpirationSeconds())
                 .build();
+
+        return new VolumeBuilder()
+                .withName(vault.volumeName())
+                .withNewProjected()
+                .withSources(new VolumeProjectionBuilder().withServiceAccountToken(tokenProjection).build())
+                .endProjected()
+                .build();
+    }
+
+    /**
+     * Tells the pipeline where its secret stores are, as environment variables.
+     * <p>
+     * One set of coordinates per vault bound to this pipeline's source, destination or transforms.
+     * The address and auth role are the platform's; the name and the path are the vault's, taken
+     * from its {@code items}. A pipeline bound to nothing gets an identity and no coordinates —
+     * the deliberate intermediate state where credentials are still written into its configuration.
+     * </p>
+     * <p>
+     * Environment variables rather than configuration properties because {@code spec.quarkus.config}
+     * renders under the {@code quarkus.} prefix and nothing in the custom resource renders a bare
+     * {@code debezium.vault.*} property. MicroProfile maps {@code DEBEZIUM_VAULT_...} back onto the
+     * dotted name when the server looks it up, so the destination is the same; only the route
+     * differs.
+     * </p>
+     */
+    private Optional<RuntimeEnvironment> createVaultEnvironment(PipelineFlat pipeline) {
+        var vault = pipelineConfigGroup.vault();
+
+        if (vault.address().isEmpty()) {
+            return Optional.empty();
+        }
+
+        var bound = boundVaults(pipeline);
+        if (bound.isEmpty()) {
+            return Optional.empty();
+        }
+
+        String tokenPath = VAULT_TOKEN_MOUNT_FORMAT.formatted(vault.volumeName(), VAULT_TOKEN_FILE_NAME);
+
+        List<ContainerEnvVar> vars = new ArrayList<>();
+        // Naming the vaults explicitly, because the server cannot enumerate them from environment
+        // variables — the vault name and the property beneath it are no longer distinguishable once
+        // both are upper-cased.
+        vars.add(envVar(VAULT_NAMES_ENV, String.join(",", bound.keySet())));
+        bound.forEach((name, path) -> {
+            String prefix = VAULT_ENV_PREFIX + name.toUpperCase(Locale.ROOT) + "_";
+            vars.add(envVar(prefix + "ADDRESS", vault.address().get()));
+            vars.add(envVar(prefix + "PATH", path));
+            vars.add(envVar(prefix + "AUTH_ROLE", vault.authRole()));
+            vars.add(envVar(prefix + "AUTH_TOKEN_PATH", tokenPath));
+        });
+
+        var environment = new RuntimeEnvironment();
+        environment.setVars(vars);
+        return Optional.of(environment);
+    }
+
+    /**
+     * The vaults this pipeline is bound to, by name, each with the path it serves.
+     * <p>
+     * Walks this pipeline's components only, so a pod is told about the stores its own
+     * configuration refers to and nothing else. The binding carries an id; the row is read here,
+     * at deploy time, so a vault's path can be corrected without touching every component bound
+     * to it, and so the pipeline view that arrives through the outbox need carry nothing more
+     * than the reference it already does. Sorted by name for a stable resource: the bindings are
+     * sets, and a reordering is a diff the operator would act on.
+     * </p>
+     * <p>
+     * A vault without a {@code path} item is skipped rather than emitted half-formed; the
+     * {@code ${vault::name/key}} reference that needs it then fails in the pod, naming the vault.
+     * </p>
+     */
+    private Map<String, String> boundVaults(PipelineFlat pipeline) {
+        Map<String, String> bound = new TreeMap<>();
+
+        Stream.concat(Stream.of(pipeline.getSource(), pipeline.getDestination()), streamOf(pipeline.getTransforms()))
+                .filter(Objects::nonNull)
+                .map(PipelineComponent::getVaults)
+                .filter(Objects::nonNull)
+                .flatMap(Set::stream)
+                .map(VaultReference::getId)
+                .filter(Objects::nonNull)
+                .map(vaultService::findById)
+                .flatMap(Optional::stream)
+                .forEach(vault -> pathOf(vault).ifPresent(path -> bound.putIfAbsent(vault.getName(), path)));
+
+        return bound;
+    }
+
+    private static Optional<String> pathOf(Vault vault) {
+        return Optional.ofNullable(vault.getItems())
+                .map(items -> items.get(VAULT_PATH_ITEM))
+                .filter(path -> !path.isBlank());
+    }
+
+    private static <T> Stream<T> streamOf(List<T> list) {
+        return list == null ? Stream.empty() : list.stream();
+    }
+
+    private static ContainerEnvVar envVar(String name, String value) {
+        var variable = new ContainerEnvVar();
+        variable.setName(name);
+        variable.setValue(value);
+        return variable;
     }
 
     private Sink createSink(PipelineFlat pipeline) {

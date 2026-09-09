@@ -28,4 +28,6 @@ public interface PipelineConfigGroup {
     MonitoringConfigGroup monitoring();
 
     HealthProbesConfigGroup health();
+
+    VaultConfigGroup vault();
 }

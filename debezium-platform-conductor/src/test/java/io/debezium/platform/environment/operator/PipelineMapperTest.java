@@ -9,6 +9,7 @@ import static io.debezium.platform.environment.database.DatabaseConnectionConfig
 import static io.debezium.platform.environment.database.DatabaseConnectionConfiguration.USERNAME;
 import static io.debezium.platform.environment.operator.OperatorPipelineController.LABEL_DBZ_CONDUCTOR_ID;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.tuple;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -16,6 +17,7 @@ import static org.mockito.Mockito.when;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -31,11 +33,14 @@ import io.debezium.operator.api.model.runtime.metrics.Metrics;
 import io.debezium.operator.api.model.runtime.metrics.MetricsBuilder;
 import io.debezium.platform.config.PipelineConfigGroup;
 import io.debezium.platform.data.model.ConnectionEntity;
+import io.debezium.platform.domain.VaultService;
 import io.debezium.platform.domain.views.Connection;
 import io.debezium.platform.domain.views.Transform;
+import io.debezium.platform.domain.views.Vault;
 import io.debezium.platform.domain.views.flat.DestinationFlat;
 import io.debezium.platform.domain.views.flat.PipelineFlat;
 import io.debezium.platform.domain.views.flat.SourceFlat;
+import io.debezium.platform.domain.views.refs.VaultReference;
 import io.debezium.platform.environment.operator.configuration.TableNameResolver;
 import io.debezium.platform.environment.operator.metrics.OpenTelemetryExporterStrategy;
 
@@ -48,6 +53,9 @@ public class PipelineMapperTest {
 
     @Mock
     TableNameResolver tableNameResolver;
+
+    @Mock
+    VaultService vaultService;
 
     private PipelineMapper pipelineMapper;
 
@@ -112,6 +120,180 @@ public class PipelineMapperTest {
         assertThat(result.getMetadata().getLabels())
                 .containsEntry("argocd.argoproj.io/instance", "debezium-platform")
                 .containsEntry(LABEL_DBZ_CONDUCTOR_ID, "1");
+    }
+
+    @Test
+    public void testMapper_ShouldNotGiveWorkloadIdentityWhenVaultDisabled() {
+        when(pipelineConfigGroup.vault().enabled()).thenReturn(false);
+
+        var pipeline = mockPipelineWithSource(ConnectionEntity.Type.POSTGRESQL, Map.of(DATABASE, "customers"));
+        when(pipeline.getName()).thenReturn("pipeline-a");
+
+        var runtime = pipelineMapper.map(pipeline).getSpec().getRuntime();
+
+        // Leaving serviceAccount unset is what makes the operator create and own one, which is the
+        // behaviour every existing deployment relies on.
+        assertThat(runtime.getServiceAccount()).isNull();
+        assertThat(runtime.getStorage().getExternal()).isEmpty();
+    }
+
+    @Test
+    public void testMapper_ShouldGiveEachPipelineItsOwnIdentityWhenVaultEnabled() {
+        when(pipelineConfigGroup.vault().enabled()).thenReturn(true);
+        when(pipelineConfigGroup.vault().audience()).thenReturn("openbao");
+        when(pipelineConfigGroup.vault().volumeName()).thenReturn("openbao-token");
+        when(pipelineConfigGroup.vault().tokenExpirationSeconds()).thenReturn(600L);
+
+        var pipeline = mockPipelineWithSource(ConnectionEntity.Type.POSTGRESQL, Map.of(DATABASE, "customers"));
+        when(pipeline.getName()).thenReturn("pipeline-a");
+
+        var runtime = pipelineMapper.map(pipeline).getSpec().getRuntime();
+
+        assertThat(runtime.getServiceAccount()).isEqualTo("pipeline-a-sa");
+        assertThat(runtime.getStorage().getExternal()).hasSize(1);
+
+        var volume = runtime.getStorage().getExternal().getFirst();
+        assertThat(volume.getName()).isEqualTo("openbao-token");
+
+        var token = volume.getProjected().getSources().getFirst().getServiceAccountToken();
+        // The audience is what stops a token issued for the secret backend being replayed against
+        // the Kubernetes API server, so an unset one is a security regression rather than a default.
+        assertThat(token.getAudience()).isEqualTo("openbao");
+        assertThat(token.getPath()).isEqualTo("token");
+        assertThat(token.getExpirationSeconds()).isEqualTo(600L);
+    }
+
+    @Test
+    public void testMapper_ShouldKeepEphemeralDataStorageWhenVaultEnabled() {
+        when(pipelineConfigGroup.vault().enabled()).thenReturn(true);
+        when(pipelineConfigGroup.vault().audience()).thenReturn("openbao");
+        when(pipelineConfigGroup.vault().volumeName()).thenReturn("openbao-token");
+        when(pipelineConfigGroup.vault().tokenExpirationSeconds()).thenReturn(600L);
+
+        var pipeline = mockPipelineWithSource(ConnectionEntity.Type.POSTGRESQL, Map.of(DATABASE, "customers"));
+        when(pipeline.getName()).thenReturn("pipeline-a");
+
+        var storage = pipelineMapper.map(pipeline).getSpec().getRuntime().getStorage();
+
+        // Adding an external volume must not silently drop the data storage the pipeline already
+        // had; it is a sibling field on the same object.
+        assertThat(storage.getData()).isNotNull();
+    }
+
+    @Test
+    public void testMapper_ShouldEmitCoordinatesForEachBoundVault() {
+        enableVaultWithAddress();
+
+        var pipeline = mockPipelineWithSource(ConnectionEntity.Type.POSTGRESQL, Map.of(
+                DATABASE, "customers",
+                USERNAME, "${vault::ecommerce/username}",
+                "password", "${vault::ecommerce/password}"));
+        when(pipeline.getName()).thenReturn("pipeline-a");
+        var ecommerce = mockVault("ecommerce", "db/ecommerce/creds/pipeline");
+        var kafka = mockVault("kafka", "secret/data/debezium/demo/kafka");
+        when(pipeline.getSource().getVaults()).thenReturn(Set.of(ecommerce));
+        when(pipeline.getDestination().getVaults()).thenReturn(Set.of(kafka));
+
+        var spec = pipelineMapper.map(pipeline).getSpec();
+
+        // The reference the admin stored on the connection reaches the resource untouched: the
+        // mapper no longer decides which vault a credential comes from, the binding does.
+        assertThat(spec.getSource().getConfig().getProps())
+                .containsEntry("database.user", "${vault::ecommerce/username}")
+                .containsEntry("database.password", "${vault::ecommerce/password}");
+
+        // One set of coordinates per bound vault; address and role are the platform's, the path is
+        // the vault's own.
+        assertThat(spec.getRuntime().getEnvironment().getVars())
+                .extracting("name", "value")
+                .containsExactly(
+                        tuple("DEBEZIUM_VAULT_NAMES", "ecommerce,kafka"),
+                        tuple("DEBEZIUM_VAULT_ECOMMERCE_ADDRESS", "http://openbao.openbao.svc:8200"),
+                        tuple("DEBEZIUM_VAULT_ECOMMERCE_PATH", "db/ecommerce/creds/pipeline"),
+                        tuple("DEBEZIUM_VAULT_ECOMMERCE_AUTH_ROLE", "pipeline"),
+                        tuple("DEBEZIUM_VAULT_ECOMMERCE_AUTH_TOKEN_PATH", "/debezium/external/openbao-token/token"),
+                        tuple("DEBEZIUM_VAULT_KAFKA_ADDRESS", "http://openbao.openbao.svc:8200"),
+                        tuple("DEBEZIUM_VAULT_KAFKA_PATH", "secret/data/debezium/demo/kafka"),
+                        tuple("DEBEZIUM_VAULT_KAFKA_AUTH_ROLE", "pipeline"),
+                        tuple("DEBEZIUM_VAULT_KAFKA_AUTH_TOKEN_PATH", "/debezium/external/openbao-token/token"));
+    }
+
+    @Test
+    public void testMapper_ShouldEmitOnlyThisPipelinesVaults() {
+        enableVaultWithAddress();
+
+        var pipeline = mockPipelineWithSource(ConnectionEntity.Type.POSTGRESQL, Map.of(DATABASE, "inventory"));
+        when(pipeline.getName()).thenReturn("pipeline-b");
+        var inventory = mockVault("inventory", "db/inventory/creds/pipeline");
+        var kafka = mockVault("kafka", "secret/data/debezium/demo/kafka");
+        when(pipeline.getSource().getVaults()).thenReturn(Set.of(inventory));
+        when(pipeline.getDestination().getVaults()).thenReturn(Set.of(kafka));
+
+        var vars = pipelineMapper.map(pipeline).getSpec().getRuntime().getEnvironment().getVars();
+
+        // The coordinates follow the binding: a second database is a second vault row and
+        // nothing platform-wide, so a pipeline bound to it must not hear about the first.
+        assertThat(vars)
+                .extracting("name", "value")
+                .contains(tuple("DEBEZIUM_VAULT_NAMES", "inventory,kafka"))
+                .noneMatch(t -> t.toString().contains("ECOMMERCE"));
+    }
+
+    @Test
+    public void testMapper_ShouldSkipBoundVaultWithoutPath() {
+        enableVaultWithAddress();
+
+        var pipeline = mockPipelineWithSource(ConnectionEntity.Type.POSTGRESQL, Map.of(DATABASE, "customers"));
+        when(pipeline.getName()).thenReturn("pipeline-a");
+        var ecommerce = mockVault("ecommerce", "db/ecommerce/creds/pipeline");
+        var halfRegistered = mockVault("half-registered", null);
+        when(pipeline.getSource().getVaults()).thenReturn(Set.of(ecommerce, halfRegistered));
+
+        var vars = pipelineMapper.map(pipeline).getSpec().getRuntime().getEnvironment().getVars();
+
+        assertThat(vars)
+                .extracting("name", "value")
+                .contains(tuple("DEBEZIUM_VAULT_NAMES", "ecommerce"))
+                .noneMatch(t -> t.toString().contains("HALF-REGISTERED"));
+    }
+
+    @Test
+    public void testMapper_ShouldEmitNoCoordinatesWhenNothingIsBound() {
+        enableVaultWithAddress();
+
+        var pipeline = mockPipelineWithSource(ConnectionEntity.Type.POSTGRESQL, Map.of(
+                DATABASE, "customers",
+                USERNAME, "a-stored-username"));
+        when(pipeline.getName()).thenReturn("pipeline-a");
+
+        var spec = pipelineMapper.map(pipeline).getSpec();
+
+        // Identity without resolution is a deliberate intermediate state: the pod can prove who it
+        // is, while credentials still come from the stored connection.
+        assertThat(spec.getRuntime().getServiceAccount()).isEqualTo("pipeline-a-sa");
+        assertThat(spec.getRuntime().getEnvironment().getVars()).isNullOrEmpty();
+        assertThat(spec.getSource().getConfig().getProps()).containsEntry("database.user", "a-stored-username");
+    }
+
+    @Test
+    public void testMapper_ShouldEmitNoCoordinatesWhenVaultHasNoAddress() {
+        when(pipelineConfigGroup.vault().enabled()).thenReturn(true);
+        when(pipelineConfigGroup.vault().audience()).thenReturn("openbao");
+        when(pipelineConfigGroup.vault().volumeName()).thenReturn("openbao-token");
+        when(pipelineConfigGroup.vault().tokenExpirationSeconds()).thenReturn(600L);
+        when(pipelineConfigGroup.vault().address()).thenReturn(Optional.empty());
+
+        var pipeline = mockPipelineWithSource(ConnectionEntity.Type.POSTGRESQL, Map.of(DATABASE, "customers"));
+        when(pipeline.getName()).thenReturn("pipeline-a");
+        var ecommerce = mockVault("ecommerce", "db/ecommerce/creds/pipeline");
+        when(pipeline.getSource().getVaults()).thenReturn(Set.of(ecommerce));
+
+        var spec = pipelineMapper.map(pipeline).getSpec();
+
+        // A binding without a store to reach is not an error here; the platform half is missing,
+        // and that is the operator's to supply.
+        assertThat(spec.getRuntime().getServiceAccount()).isEqualTo("pipeline-a-sa");
+        assertThat(spec.getRuntime().getEnvironment().getVars()).isNullOrEmpty();
     }
 
     @Test
@@ -262,8 +444,34 @@ public class PipelineMapperTest {
         assertThat(result.getSpec().getPredicates()).isEmpty();
     }
 
+    private void enableVaultWithAddress() {
+        when(pipelineConfigGroup.vault().enabled()).thenReturn(true);
+        when(pipelineConfigGroup.vault().audience()).thenReturn("openbao");
+        when(pipelineConfigGroup.vault().volumeName()).thenReturn("openbao-token");
+        when(pipelineConfigGroup.vault().tokenExpirationSeconds()).thenReturn(600L);
+        when(pipelineConfigGroup.vault().authRole()).thenReturn("pipeline");
+        when(pipelineConfigGroup.vault().address()).thenReturn(Optional.of("http://openbao.openbao.svc:8200"));
+    }
+
+    /**
+     * A bound vault: the reference a component carries (id only, as it arrives through the
+     * outbox) and the row the mapper reads for it.
+     */
+    private VaultReference mockVault(String name, String path) {
+        long id = name.hashCode() & 0xffff;
+        var reference = mock(VaultReference.class);
+        when(reference.getId()).thenReturn(id);
+
+        var row = mock(Vault.class);
+        when(row.getName()).thenReturn(name);
+        when(row.getItems()).thenReturn(path == null ? Map.of("keys", "username,password") : Map.of("path", path, "keys", "username,password"));
+        when(vaultService.findById(id)).thenReturn(Optional.of(row));
+
+        return reference;
+    }
+
     private PipelineMapper createMapper() {
-        return new PipelineMapper(pipelineConfigGroup, tableNameResolver, buildMetrics(pipelineConfigGroup));
+        return new PipelineMapper(pipelineConfigGroup, tableNameResolver, buildMetrics(pipelineConfigGroup), vaultService);
     }
 
     private static Metrics buildMetrics(PipelineConfigGroup config) {

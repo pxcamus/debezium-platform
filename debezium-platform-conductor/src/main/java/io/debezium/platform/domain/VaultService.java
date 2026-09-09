@@ -5,6 +5,8 @@
  */
 package io.debezium.platform.domain;
 
+import java.util.Optional;
+
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Event;
 import jakarta.inject.Inject;
@@ -32,6 +34,17 @@ public class VaultService extends AbstractService<VaultEntity, Vault, VaultRefer
 
     public VaultService(EntityManager em, CriteriaBuilderFactory cbf, EntityViewManager evm) {
         super(VaultEntity.class, Vault.class, VaultReference.class, em, cbf, evm);
+    }
+
+    /**
+     * Opens a transaction rather than joining one, because the pipeline mapper reads vault rows
+     * from the outbox consumer thread at deploy time, where neither a request context nor a
+     * transaction is active and the {@code SUPPORTS} default cannot touch the session.
+     */
+    @Override
+    @Transactional(Transactional.TxType.REQUIRED)
+    public Optional<Vault> findById(Long id) {
+        return super.findById(id);
     }
 
     @Override
