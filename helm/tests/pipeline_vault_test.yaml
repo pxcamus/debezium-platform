@@ -1,0 +1,122 @@
+suite: test pipeline vault configuration
+templates:
+  - conductor-deployment.yaml
+  - conductor-role.yaml
+values:
+  - ../../examples/example.yaml
+tests:
+  - it: should not set any PIPELINE_VAULT_* env var by default
+    template: conductor-deployment.yaml
+    asserts:
+      - isKind:
+          of: Deployment
+      # One notContains per var the template can render; together they cover
+      # "no env var whose name starts with PIPELINE_VAULT_".
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PIPELINE_VAULT_ENABLED
+          any: true
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PIPELINE_VAULT_AUDIENCE
+          any: true
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PIPELINE_VAULT_AUTH_ROLE
+          any: true
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PIPELINE_VAULT_ADDRESS
+          any: true
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PIPELINE_VAULT_VOLUME_NAME
+          any: true
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PIPELINE_VAULT_TOKEN_EXPIRATION_SECONDS
+          any: true
+
+  - it: should not grant the conductor a ServiceAccount rule by default
+    template: conductor-role.yaml
+    asserts:
+      - isKind:
+          of: Role
+      - notContains:
+          path: rules
+          content:
+            resources: ["serviceaccounts"]
+          any: true
+
+  - it: should set the vault env vars when pipeline.vault.enabled is true
+    template: conductor-deployment.yaml
+    set:
+      pipeline.vault.enabled: true
+    asserts:
+      - isKind:
+          of: Deployment
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PIPELINE_VAULT_ENABLED
+            value: "true"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PIPELINE_VAULT_AUDIENCE
+            value: openbao
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PIPELINE_VAULT_AUTH_ROLE
+            value: pipeline
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PIPELINE_VAULT_VOLUME_NAME
+            value: openbao-token
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PIPELINE_VAULT_TOKEN_EXPIRATION_SECONDS
+            value: "600"
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PIPELINE_VAULT_ADDRESS
+          any: true
+
+  - it: should set PIPELINE_VAULT_ADDRESS when an address is configured
+    template: conductor-deployment.yaml
+    set:
+      pipeline.vault.enabled: true
+      pipeline.vault.address: http://bao:8200
+    asserts:
+      - isKind:
+          of: Deployment
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PIPELINE_VAULT_ADDRESS
+            value: http://bao:8200
+
+  - it: should grant the conductor a ServiceAccount rule when pipeline.vault.enabled is true
+    template: conductor-role.yaml
+    set:
+      pipeline.vault.enabled: true
+    asserts:
+      - isKind:
+          of: Role
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["serviceaccounts"]
+            verbs: ["create", "update", "patch", "get", "list", "delete", "deletecollection"]
+          count: 1
