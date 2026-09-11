@@ -120,6 +120,12 @@ The following operators must be installed in the cluster **before** deploying th
 | pipeline.health.readiness.periodSeconds    | Interval in seconds between readiness probes                                                                                                                                          | 10                                         |
 | pipeline.health.readiness.timeoutSeconds   | Timeout in seconds for each readiness probe                                                                                                                                           | 10                                         |
 | pipeline.health.readiness.failureThreshold | Consecutive readiness failures before the container is marked unready                                                                                                                  | 3                                          |
+| pipeline.vault.enabled                     | Give each pipeline pod its own ServiceAccount and a projected token scoped to the secret backend, so it fetches its own credentials                                                   | false                                      |
+| pipeline.vault.audience                    | Audience claim requested for the projected token; must match the audience the backend's Kubernetes auth role is bound to                                                              | openbao                                    |
+| pipeline.vault.volumeName                  | Name of the projected volume; the operator mounts it at /debezium/external/<volumeName>                                                                                               | openbao-token                              |
+| pipeline.vault.tokenExpirationSeconds      | Requested lifetime of the projected token in seconds; the kubelet rotates it before expiry                                                                                            | 600                                        |
+| pipeline.vault.address                     | Base URL of the secret store; empty gives pipelines an identity but no coordinates                                                                                                    | ""                                         |
+| pipeline.vault.authRole                    | The store's Kubernetes auth role pipelines log in as                                                                                                                                  | pipeline                                   |
 | monitoring.panels.additionalPanelsPath     | Path to a YAML file with additional monitoring panels. Panels are merged with built-in defaults; matching IDs override built-in panels.                                               | ""                                         |
 | monitoring.panels.refreshInterval          | How often the conductor reloads panels from the additional panels file. Accepts duration strings (e.g. `1s`, `30s`, `5m`).                                                            | 30s                                        |
 | monitoring.otel.enabled                    | Enable OpenTelemetry monitoring infrastructure. Requires the OpenTelemetry Operator to be installed (see Prerequisites).                                                              | false                                      |
@@ -329,6 +335,19 @@ pipeline:
 ```
 
 The labels are automatically converted to environment variables for the Conductor pod (e.g., `PIPELINE_LABELS_ARGOCD_ARGOPROJ_IO_INSTANCE`).
+
+## Pipeline Workload Identity
+
+Pipelines can fetch their database credentials from an external secret store (OpenBao, or any Vault-compatible API) instead of having the password copied into the DebeziumServer resource and its ConfigMap. Enabling `pipeline.vault.enabled` gives every pipeline pod its own ServiceAccount with a projected token whose audience is scoped to the secret store, and passes the store's coordinates to the pod as environment variables. Because the conductor then owns one ServiceAccount per pipeline, the chart also adds a ServiceAccount rule to the conductor's Role. Which vaults a pipeline reads, and the path each serves, come from Vault resources bound to the pipeline's components — not from chart values.
+
+### Configuration
+
+```yaml
+pipeline:
+  vault:
+    enabled: true
+    address: http://openbao.openbao.svc.cluster.local:8200
+```
 
 ## Additional Monitoring Panels
 

@@ -181,6 +181,24 @@ public class PipelineMapperTest {
     }
 
     @Test
+    public void testMapper_ShouldKeepProbeTemplatesWhenVaultEnabled() {
+        when(pipelineConfigGroup.vault().enabled()).thenReturn(true);
+        when(pipelineConfigGroup.vault().audience()).thenReturn("openbao");
+        when(pipelineConfigGroup.vault().volumeName()).thenReturn("openbao-token");
+        when(pipelineConfigGroup.vault().tokenExpirationSeconds()).thenReturn(600L);
+
+        var pipeline = mockPipelineWithSource(ConnectionEntity.Type.POSTGRESQL, Map.of(DATABASE, "customers"));
+        when(pipeline.getName()).thenReturn("pipeline-a");
+
+        var runtime = pipelineMapper.map(pipeline).getSpec().getRuntime();
+
+        // Vault identity and health probes are built by the same createRuntime; adding the one must
+        // not drop the other.
+        assertThat(runtime.getServiceAccount()).isEqualTo("pipeline-a-sa");
+        assertThat(runtime.getTemplates().getContainer().getProbes().getLiveness()).isNotNull();
+    }
+
+    @Test
     public void testMapper_ShouldEmitCoordinatesForEachBoundVault() {
         enableVaultWithAddress();
 

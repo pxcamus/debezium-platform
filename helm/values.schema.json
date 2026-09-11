@@ -339,6 +339,16 @@
                             "type": "integer",
                             "default": 600,
                             "description": "Requested lifetime of the projected token in seconds; the kubelet rotates it before expiry"
+                        },
+                        "address": {
+                            "type": "string",
+                            "default": "",
+                            "description": "Base URL of the secret store; empty gives pipelines an identity but no coordinates"
+                        },
+                        "authRole": {
+                            "type": "string",
+                            "default": "pipeline",
+                            "description": "The store's Kubernetes auth role pipelines log in as"
                         }
                     }
                 }
